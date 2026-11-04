@@ -40,11 +40,29 @@ ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,36}$")
 MB = 1024 * 1024
 
 
+def _as_dict(obj):
+    """
+    Normalises an SDK response to Appwrite's own JSON field names.
+
+    Older Python SDKs return dicts. Newer ones (27.x) return pydantic models that
+    rename fields (teamId -> teamid, $id -> id) and keep a row's own columns in
+    .data, so attribute access by the API name silently returns nothing.
+    to_dict() restores the API names; a row's "data" is merged back to the top.
+    """
+    if obj is None:
+        return {}
+    if not isinstance(obj, dict):
+        to_dict = getattr(obj, "to_dict", None)
+        obj = to_dict() if callable(to_dict) else {}
+    nested = obj.get("data")
+    if isinstance(nested, dict):
+        return {**nested, **{k: v for k, v in obj.items() if k != "data"}}
+    return obj
+
+
 def _field(obj, key):
-    """Works with dict responses (older SDKs) and model objects (newer SDKs)."""
-    if isinstance(obj, dict):
-        return obj.get(key)
-    return getattr(obj, key.lstrip("$"), None)
+    """Reads a field by its Appwrite API name, whatever the SDK version returned."""
+    return _as_dict(obj).get(key)
 
 
 def _fail(res, status, code, message):
