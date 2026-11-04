@@ -1,0 +1,4 @@
+# Pin these to the same versions as your other Python functions
+# (copy the lines from the upload-credentials deployment's requirements.txt).
+appwrite
+requests
