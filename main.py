@@ -8,7 +8,11 @@ repeatedly is safe and corrects drift from any source.
 
 Triggers
   POST {"teamId": "..."}                      recalculate one team
-                                              (confirmed owner/admin/editor)
+                                              (confirmed owner/admin/editor).
+                                              The app executes it ASYNC (no 30 s
+                                              sync limit) and reads storageUsed
+                                              back; the response body is for
+                                              console/sync callers only.
   POST {"teamId": "...", "includeB2": true}   also report actual B2 usage under
                                               "<teamId>/" (owner/admin only;
                                               report only, never written)
@@ -33,7 +37,8 @@ from appwrite.services.users import Users
 DATABASE_ID = os.environ.get("DATABASE_ID", "66c0c189002c3b8eb3ea")
 FILES = "files"
 TEAMS = "teams"
-PAGE = 100
+# Rows per page. Only $id and size are fetched, so large pages stay small.
+PAGE = 500
 EDIT_ROLES = {"owner", "admin", "editor"}
 AUDIT_ROLES = {"owner", "admin"}
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,36}$")
@@ -78,14 +83,23 @@ def _parse_body(req):
     return body or {}
 
 
-def _pages(db, collection, queries):
-    """Yields every row matching `queries`, using cursor pagination."""
+def _pages(db, collection, queries, columns):
+    """
+    Yields every row matching `queries`, using cursor pagination.
+
+    total=False skips Appwrite's row count, which otherwise runs on every page
+    and dominates the time on large tables. Only `columns` are fetched.
+    """
     cursor = None
     while True:
-        page_queries = [*queries, Query.limit(PAGE)]
+        page_queries = [*queries, Query.select(["$id", *columns]), Query.limit(PAGE)]
         if cursor:
             page_queries.append(Query.cursor_after(cursor))
-        rows = _field(db.list_documents(database_id=DATABASE_ID, collection_id=collection, queries=page_queries), "documents") or []
+        try:
+            result = db.list_documents(database_id=DATABASE_ID, collection_id=collection, queries=page_queries, total=False)
+        except TypeError:  # SDK older than the pinned one: no `total` parameter
+            result = db.list_documents(database_id=DATABASE_ID, collection_id=collection, queries=page_queries)
+        rows = _field(result, "documents") or []
         yield from rows
         if len(rows) < PAGE:
             return
@@ -95,7 +109,7 @@ def _pages(db, collection, queries):
 def recalculate_team(db, team_id):
     """Sums live file sizes for one team and writes storageUsed. Returns a summary."""
     total_bytes, files, missing_size = 0, 0, 0
-    for row in _pages(db, FILES, [Query.equal("teamId", team_id), Query.equal("deleted", False)]):
+    for row in _pages(db, FILES, [Query.equal("teamId", team_id), Query.equal("deleted", False)], ["size"]):
         files += 1
         size = _field(row, "size")  # bytes; a number, or a string in some older rows
         try:
@@ -161,7 +175,7 @@ def b2_audit(team_id):
 
 def _scheduled(context, db):
     done, failed, drift = 0, 0, 0.0
-    for team in _pages(db, TEAMS, []):
+    for team in _pages(db, TEAMS, [], []):
         team_id = _field(team, "$id")
         try:
             summary = recalculate_team(db, team_id)
@@ -236,6 +250,7 @@ def main(context):
     if body.get("includeB2") and not roles & AUDIT_ROLES:
         return _fail(res, 403, "forbidden", "Only owners and admins can run the B2 audit.")
 
+    started = time.time()
     try:
         summary = recalculate_team(db, team_id)
     except Exception as e:
@@ -248,6 +263,10 @@ def main(context):
         except Exception as e:
             context.error(f"b2 audit {team_id}: {e}")
             summary["b2"] = {"error": "B2 audit failed; see function logs."}
+        # The app runs this function asynchronously, which discards the response
+        # body, so the audit result is only visible in the execution log.
+        context.log(f"b2 audit team={team_id}: {summary['b2']}")
 
-    context.log(f"recalculated team={team_id} user={user_id} {summary['previousMB']} -> {summary['storageUsedMB']} MB")
+    context.log(f"recalculated team={team_id} user={user_id} {summary['previousMB']} -> {summary['storageUsedMB']} MB "
+                f"({summary['liveFiles']} files, {round(time.time() - started, 1)}s)")
     return res.json({"ok": True, **summary}, 200)
